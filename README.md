@@ -1,4 +1,5 @@
 # story-installer-tui
+
 A one liner Terminal User Interface to install and manage Story Protocol Node and Services
 This script provides an interactive interface for managing **Story** and **Geth** nodes. It offers options to install dependencies, download snapshots, update binaries, monitor node status, and manage services efficiently using `whiptail` menus.
 ----
