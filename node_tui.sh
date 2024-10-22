@@ -36,15 +36,32 @@ function exit_script {
   exit 1
 }
 
+# Function: check sudo
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root or with sudo" 
+   exit 1
+fi
+
+# Function: Install dependencies
+function install_dependencies() {
+    sudo apt update && sudo apt upgrade -y
+    sudo apt install curl git wget htop tmux build-essential jq make lz4 gcc unzip aria2 -y
+}
+
 # Function: Download and extract binaries
 function download_binaries {
   echo -e "$GREEN Downloading binaries...$NORMAL"
   wget $STORY_BINARY_URL -O story-binary.tar.gz
-  tar -xzvf story-binary.tar.gz && sudo mv story /usr/local/bin/
+  tar -xzvf story-binary.tar.gz && sudo mv story-linux-amd64-0.11.0-aac4bfe/story /usr/local/bin/
   wget $GETH_BINARY_URL -O geth-linux-amd64 && chmod +x geth-linux-amd64
   sudo mv geth-linux-amd64 /usr/local/bin/story-geth
-  sudo systemctl restart $STORY_SERVICE $GETH_SERVICE
   echo -e "$GREEN Binaries updated and services restarted.$NORMAL"
+}
+
+# Function: Initialize Node
+function initialize_node {
+  read -p "Enter the node name (MONIKER): " MONIKER
+  /usr/local/bin/story init --moniker $MONIKER --network iliad
 }
 
 # Function: Create systemd service files
@@ -93,6 +110,29 @@ function restart_services {
   sudo systemctl restart $STORY_SERVICE $GETH_SERVICE
 }
 
+# Function: Download snapshots
+function download_snapshot {
+  if [ "$SNAPSHOT" == "archival" ]; then
+    echo -e "$GREEN Downloading archival snapshots...$NORMAL"
+    wget $ARCHIVAL_GETH_SNAPSHOT -O geth_snapshot.lz4
+    wget $ARCHIVAL_STORY_SNAPSHOT -O story_snapshot.lz4
+  else
+    echo -e "$GREEN Downloading pruned snapshots...$NORMAL"
+    wget $PRUNED_GETH_SNAPSHOT -O geth_snapshot.lz4
+    wget $PRUNED_STORY_SNAPSHOT -O story_snapshot.lz4
+  fi
+}
+
+# Function: Extract snapshots and delete
+function extract_snapshot {
+  echo -e "$GREEN Extracting snapshots...$NORMAL"
+  lz4 -d geth_snapshot.lz4 | tar -C ~/.story/geth/iliad/geth -xv
+  lz4 -d story_snapshot.lz4 | tar -C ~/.story/story -xv
+
+  echo -e "$GREEN Removing snapshots...$NORMAL"
+  rm -rf geth_snapshot.lz4 story_snapshot.lz4
+}
+
 # Main menu using whiptail
 OPTION=$(whiptail --title "Node Setup Menu" --menu "Select an option:" 20 78 11 \
 "1" "Install Node Environment" \
@@ -110,103 +150,109 @@ OPTION=$(whiptail --title "Node Setup Menu" --menu "Select an option:" 20 78 11 
 if [ $? != 0 ]; then exit_script; fi
 
 case $OPTION in
-  1)
-    if whiptail --yesno "Proceed with node installation? This will override existing data." 10 60; then
-      echo -e "$GREEN Installing dependencies...$NORMAL"
-      sudo apt update && sudo apt install -y curl git jq lz4 wget build-essential
-      download_binaries
-      create_services
-      echo -e "$GREEN Installation complete!$NORMAL"
-    fi
-    ;;
-  2)
-    SNAPSHOT=$(whiptail --radiolist "Choose snapshot type:" 15 60 2 \
-      "archival" "Full blockchain history (large)" ON \
-      "pruned" "Lightweight snapshot" OFF 3>&1 1>&2 2>&3)
-
-    if [ $? != 0 ]; then exit_script; fi
-
-    stop_services
-
-    if [ "$SNAPSHOT" == "archival" ]; then
-      echo -e "$GREEN Downloading archival snapshots...$NORMAL"
-      wget $ARCHIVAL_GETH_SNAPSHOT -O geth_snapshot.lz4
-      wget $ARCHIVAL_STORY_SNAPSHOT -O story_snapshot.lz4
-    else
-      echo -e "$GREEN Downloading pruned snapshots...$NORMAL"
-      wget $PRUNED_GETH_SNAPSHOT -O geth_snapshot.lz4
-      wget $PRUNED_STORY_SNAPSHOT -O story_snapshot.lz4
-    fi
-
-    echo -e "$GREEN Extracting snapshots...$NORMAL"
-    lz4 -d geth_snapshot.lz4 | tar -C ~/.story/geth/iliad/geth -xv
-    lz4 -d story_snapshot.lz4 | tar -C ~/.story/story -xv
-
+1)
+  if whiptail --yesno "Proceed with node installation? This will override existing data." 10 60; then
+    echo -e "$GREEN Installing dependencies...$NORMAL"
+    install_dependencies
+    download_binaries
+    initialize_node
+    create_services
     restart_services
-    ;;
-  3)
-    BINARY=$(whiptail --menu "Select binary to update:" 15 60 2 \
-      "story" "Update Story binary" \
-      "geth" "Update Geth binary" 3>&1 1>&2 2>&3)
+    echo -e "$GREEN Installation complete!$NORMAL"
+  fi
+  ;;
+2)
+  SNAPSHOT=$(whiptail --title "Snapshot Selection" --menu \
+    "Choose snapshot type:" 15 60 2 \
+    "archival" "Full blockchain history (large)" \
+    "pruned" "Lightweight snapshot" 3>&1 1>&2 2>&3)
 
-    if [ $? != 0 ]; then exit_script; fi
+  if [ $? != 0 ]; then exit_script; fi
+  stop_services
+  download_snapshot
 
-    stop_services
+  # Backup priv_validator_state.json
+  echo -e "$GREEN Backing up priv_validator_state.json...$NORMAL"
+  cp ~/.story/story/data/priv_validator_state.json ~/.story/story/priv_validator_state.json.backup
 
-    if [ "$BINARY" == "story" ]; then
-      echo -e "$GREEN Updating Story binary...$NORMAL"
-      wget $STORY_BINARY_URL -O story-binary.tar.gz
-      tar -xzvf story-binary.tar.gz && sudo mv story /usr/local/bin/
-    elif [ "$BINARY" == "geth" ]; then
-      echo -e "$GREEN Updating Geth binary...$NORMAL"
-      wget $GETH_BINARY_URL -O geth-linux-amd64 && chmod +x geth-linux-amd64
-      sudo mv geth-linux-amd64 /usr/local/bin/story-geth
-    fi
+  # Remove old data
+  echo -e "$GREEN Removing old data...$NORMAL"
+  rm -rf ~/.story/story/data
+  rm -rf ~/.story/geth/iliad/geth/chaindata
 
-    restart_services
-    ;;
-  4)
-    echo -e "$GREEN Monitoring node status...$NORMAL"
-    while true; do
-      YOUR_BLOCK=$(curl -s localhost:26657/status | jq -r '.result.sync_info.latest_block_height')
-      RPC_BLOCK=$(curl -s $RPC_ENDPOINT/status | jq -r '.result.sync_info.latest_block_height')
-      LAG=$((RPC_BLOCK - YOUR_BLOCK))
-      echo -e "$GREEN Your Block: $YOUR_BLOCK | RPC Block: $RPC_BLOCK | Lag: $LAG blocks$NORMAL"
-      sleep 5
-    done
-    ;;
-  5)
-    LOG=$(whiptail --menu "Select logs to view:" 15 60 2 \
-      "${STORY_SERVICE}" "View Story logs" \
-      "${GETH_SERVICE}" "View Geth logs" 3>&1 1>&2 2>&3)
+  extract_snapshot
 
-    if [ $? != 0 ]; then exit_script; fi
+  # Restore priv_validator_state.json
+  echo -e "$GREEN Extracting snapshots...$NORMAL"
+  mv ~/.story/story/priv_validator_state.json.backup ~/.story/story/data/priv_validator_state.json
 
-    sudo journalctl -u ${LOG} -f
-    ;;
-  6)
-    sed -i "s/^seeds *=.*/seeds = \"$SEEDS\"/" ~/.story/story/config/config.toml
-    restart_services
-    ;;
-  7)
-    PEERS=$(curl -s ${RPC_ENDPOINT}/net_info | jq -r '.result.peers[] | .remote_ip' | paste -sd,)
-    sed -i "s/^persistent_peers *=.*/persistent_peers = \"$PEERS\"/" ~/.story/story/config/config.toml
-    restart_services
-    ;;
-  8)
-    story-geth attach ~/.story/geth/iliad/geth.ipc --exec "admin.addPeer('$ENODE')"
-    ;;
-  9)
-    wget -O ~/.story/story/config/addrbook.json $ADDRBOOK_URL
-    restart_services
-    ;;
-  10)
-    stop_services
-    ;;
-  11)
-    restart_services
-    ;;
-  *)
-    exit_script
-    ;;
+  restart_services
+
+   echo -e "$GREEN Snapshot sync completed successfully.$NORMAL"
+  ;;
+3)
+  BINARY=$(whiptail --menu "Select binary to update:" 15 60 2 \
+    "story" "Update Story binary" \
+    "geth" "Update Geth binary" 3>&1 1>&2 2>&3)
+  
+  if [ $? != 0 ]; then exit_script; fi
+
+  stop_services
+
+  if [ "$BINARY" == "story" ]; then
+    echo -e "$GREEN Updating Story binary...$NORMAL"
+    wget $STORY_BINARY_URL -O story-binary.tar.gz
+    tar -xzvf story-binary.tar.gz && sudo mv story-linux-amd64-0.11.0-aac4bfe/story /usr/local/bin/
+  elif [ "$BINARY" == "geth" ]; then
+    echo -e "$GREEN Updating Geth binary...$NORMAL"
+    wget $GETH_BINARY_URL -O geth-linux-amd64 && chmod +x geth-linux-amd64
+    sudo mv geth-linux-amd64 /usr/local/bin/story-geth
+  fi
+
+  restart_services
+  ;;
+4)
+  echo -e "$GREEN Monitoring node status...$NORMAL"
+  while true; do
+    YOUR_BLOCK=$(curl -s localhost:26657/status | jq -r '.result.sync_info.latest_block_height')
+    RPC_BLOCK=$(curl -s $RPC_ENDPOINT/status | jq -r '.result.sync_info.latest_block_height')
+    LAG=$((RPC_BLOCK - YOUR_BLOCK))
+    echo -e "$GREEN Your Block: $YOUR_BLOCK | RPC Block: $RPC_BLOCK | Lag: $LAG blocks$NORMAL"
+    sleep 5
+  done
+  ;;
+5)
+  LOG=$(whiptail --menu "Select logs to view:" 15 60 2 \
+    "${STORY_SERVICE}" "View Story logs" \
+    "${GETH_SERVICE}" "View Geth logs" 3>&1 1>&2 2>&3)
+
+  if [ $? != 0 ]; then exit_script; fi
+
+  sudo journalctl -u ${LOG} -f
+  ;;
+6)
+  sed -i "s/^seeds *=.*/seeds = \"$SEEDS\"/" ~/.story/story/config/config.toml
+  restart_services
+  ;;
+7)
+  PEERS=$(curl -s ${RPC_ENDPOINT}/net_info | jq -r '.result.peers[] | .remote_ip' | paste -sd,)
+  sed -i "s/^persistent_peers *=.*/persistent_peers = \"$PEERS\"/" ~/.story/story/config/config.toml
+  restart_services
+  ;;
+8)
+  story-geth attach ~/.story/geth/iliad/geth.ipc --exec "admin.addPeer('$ENODE')"
+  ;;
+9)
+  wget -O ~/.story/story/config/addrbook.json $ADDRBOOK_URL
+  restart_services
+  ;;
+10)
+  stop_services
+  ;;
+11)
+  restart_services
+  ;;
+*)
+  exit_script
+  ;;
 esac
